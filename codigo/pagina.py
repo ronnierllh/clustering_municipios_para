@@ -6,14 +6,13 @@ from html import escape
 from pathlib import Path
 import pandas as pd
 from modelo import CENARIOS
-RAIZ = Path(__file__).resolve().parent.parent
-SAIDA = RAIZ / "data" / "output"
-WEB = RAIZ / "data" / "web"
-if len(sys.argv) != 4 or sys.argv[1] not in CENARIOS or sys.argv[2] not in ["kmeans", "ward", "kmedoids"] or not sys.argv[3].isdigit():
-    sys.exit("Uso: python src/pagina.py <C1|C2> <kmeans|ward|kmedoids> <k>   por exemplo: python src/pagina.py C1 kmeans 4")
-CENARIO = sys.argv[1]
-ALGORITMO = sys.argv[2]
-K = int(sys.argv[3])
+from experimento import ALGORITMOS
+#RAIZ = Path(__file__).resolve().parent.parent
+SAIDA = Path("dados") / "saidas"
+WEB = Path("dados") / "web"
+CENARIO = "C1"
+ALGORITMO = ALGORITMOS[0]
+K = 4
 nome = f"{CENARIO}_{ALGORITMO}_k{K}"
 if not (SAIDA / f"perfis_grupos_{nome}.csv").exists():
     sys.exit(f"Faltam os perfis desta combinação. Execute antes: python src/perfis.py {CENARIO} {ALGORITMO} {K}")
@@ -33,10 +32,10 @@ variaveis_modelo = pd.read_csv(SAIDA / "matriz_modelo.csv", index_col="cod_mun")
 bootstrap = (WEB / "bootstrap.min.css").read_text(encoding="utf-8")
 logo = base64.b64encode((WEB / "brasao_preto_vertical.svg").read_bytes()).decode()
 def numero(valor):
-    """Número com uma casa decimal e vírgula, como se escreve no Brasil."""
+    """Número com uma casa decimal e vírgula"""
     return f"{valor:.1f}".replace(".", ",")
 def simplificar(texto):
-    """Minúsculas e sem acentos, para a busca não depender deles."""
+    """Minúsculas e sem acentos, para a busca não depender deles"""
     sem_acentos = ""
     for letra in unicodedata.normalize("NFKD", texto.lower()):
         if not unicodedata.combining(letra):
@@ -197,6 +196,6 @@ partes.append('<div class="d-flex flex-wrap justify-content-between align-items-
 partes.append('<nav aria-label="Páginas"><ul id="paginacao" class="pagination pagination-sm flex-wrap mb-0"></ul></nav></div></div></section>')
 partes.append('<footer class="mt-5 small text-body-secondary"><p>Fonte: IBGE, Censo Demográfico 2022 (SIDRA, tabelas 9514, 6804, 6805 e 9923)</p></footer>')
 partes.append(f"</main><script>{SCRIPT}</script></body></html>")
-arquivo = SAIDA / f"tipologia_{nome}.html"
+arquivo = SAIDA / "tipologia.html"
 arquivo.write_text("\n".join(partes), encoding="utf-8")
 print("Página salva em", arquivo)
