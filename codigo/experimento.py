@@ -1,151 +1,201 @@
 """Plano de experimentação"""
+import sys
 from pathlib import Path
 import matplotlib.pyplot as plt
 import mlflow
 from mlflow.tracking import MlflowClient
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score, silhouette_score
-from modelo import CENARIOS, SEMENTE, agrupar, escalar, hiperparametros, soma_quadrados_intra
+from scipy.cluster.hierarchy import dendrogram
+from sklearn.metrics import adjusted_rand_score, davies_bouldin_score, silhouette_score
+from modelo import (ALGORITMOS_K, CONJUNTOS, PADRONIZACOES, VALORES_K,
+                    N_VALORES_EPS, agrupar, agrupar_dbscan, altura_uniao,
+                    arvore_ward, cenarios, distancias_vizinho, escalar,
+                    hiperparametros, valores_eps)
 
 RAIZ = Path(__file__).resolve().parent.parent
-SAIDA = Path("dados") / "saidas"
+SAIDA = RAIZ / "dados" / "saidas"
+FIGURAS = SAIDA / "figuras"
 EXPERIMENTO = "tipologia_municipios_para"
-ALGORITMOS = ["kmeans", "ward", "kmedoids"]
-VALORES_K = list(range(2, 9))
-N_SUBAMOSTRAS = 100
-FRACAO_SUBAMOSTRA = 0.8
-METRICAS = {"silhueta": "Silhueta (144 municípios)",
-            "soma_quadrados_intra": "Soma de quadrados intragrupo",
-            "silhueta_media_subamostras": "Silhueta média (subamostras)",
-            "ari_estabilidade_medio": "ARI de estabilidade médio"}
+CORES = {"kmeans": "#1d4e89", "ward": "#c8641a", "kmedoids": "#6a4c93"}
+NOMES_ALGORITMOS = {"kmeans": "K-means", "ward": "Ward", "kmedoids": "K-medoides"}
 
-matriz = pd.read_csv(SAIDA / "matriz_modelo.csv", index_col="cod_mun")
-print(f"Matriz do modelo: {matriz.shape[0]} municípios x {matriz.shape[1]} variáveis")
-municipios = matriz.index
+try:
+    indicadores = pd.read_csv(SAIDA / "indicadores_municipio.csv", index_col="cod_mun")
+except FileNotFoundError:
+    sys.exit("Falta dados/saidas/indicadores_municipio.csv. Execute antes: python codigo/preprocessamento.py")
 
-gerador = np.random.default_rng(SEMENTE)
-tamanho = int(FRACAO_SUBAMOSTRA * len(municipios))
-subamostras = []
-for b in range(N_SUBAMOSTRAS):
-    subamostras.append(np.sort(gerador.choice(municipios, size=tamanho, replace=False)))
+FIGURAS.mkdir(parents=True, exist_ok=True)
+print(f"Indicadores: {indicadores.shape[0]} municípios")
+
+def metricas_comuns(Z, grupos):
+    """Silhueta e Davies-Bouldin sobre os municípios agrupados"""
+    agrupados = grupos != -1
+    if grupos[agrupados].nunique() < 2:
+        return np.nan, np.nan
+    return (silhouette_score(Z[agrupados], grupos[agrupados]),
+            davies_bouldin_score(Z[agrupados], grupos[agrupados]))
 
 resultados = []
-for cenario, configuracao in CENARIOS.items():
-    Z = escalar(matriz, configuracao["padronizacao"])
-    for algoritmo in ALGORITMOS:
+dbscan = []
+arvores = {}
+for cenario in cenarios():
+    Z = escalar(indicadores[cenario["variaveis"]], cenario["padronizacao"])
+    arvore = arvore_ward(Z)
+    arvores[cenario["cenario"]] = arvore
+    for algoritmo in ALGORITMOS_K:
         for k in VALORES_K:
-            grupos = agrupar(Z, algoritmo, k)
-            silhuetas_sub = []
-            aris_sub = []
-            for codigos in subamostras:
-                Z_sub = escalar(matriz.loc[codigos], configuracao["padronizacao"])
-                grupos_sub = agrupar(Z_sub, algoritmo, k)
-                silhuetas_sub.append(silhouette_score(Z_sub, grupos_sub))
-                aris_sub.append(adjusted_rand_score(grupos.loc[codigos], grupos_sub))
-            resultados.append({"cenario": cenario, "algoritmo": algoritmo, "k": k, "grupos": grupos,
-                               "silhueta": silhouette_score(Z, grupos),
-                               "soma_quadrados_intra": soma_quadrados_intra(Z, grupos),
-                               "silhueta_media_subamostras": np.mean(silhuetas_sub),
-                               "ari_estabilidade_medio": np.mean(aris_sub),
-                               "silhuetas_sub": silhuetas_sub, "aris_sub": aris_sub})
+            grupos, modelo = agrupar(Z, algoritmo, k)
+            silhueta, davies_bouldin = metricas_comuns(Z, grupos)
+            resultado = {**cenario, "algoritmo": algoritmo, "k": k, "grupos": grupos,
+                         "silhueta": silhueta, "davies_bouldin": davies_bouldin}
+            if algoritmo == "kmeans":
+                resultado["inercia"] = modelo.inertia_
+            elif algoritmo == "kmedoids":
+                resultado["perda"] = modelo.inertia_
+            else:
+                resultado["altura_uniao"] = altura_uniao(arvore, k)
+            resultados.append(resultado)
+    for posicao, eps in enumerate(valores_eps(Z)):
+        grupos, modelo = agrupar_dbscan(Z, eps)
+        silhueta, davies_bouldin = metricas_comuns(Z, grupos)
+        dbscan.append({**cenario, "passo": posicao, "eps": eps,
+                       "min_samples": hiperparametros("dbscan", Z.shape[1])["min_samples"],
+                       "n_grupos": grupos[grupos != -1].nunique(), "ruido_pct": 100 * (grupos == -1).mean(),
+                       "silhueta": silhueta, "davies_bouldin": davies_bouldin})
+
 for resultado in resultados:
     for outro in resultados:
-        if outro["cenario"] == resultado["cenario"] and outro["k"] == resultado["k"] and outro["algoritmo"] != resultado["algoritmo"]:
+        mesmo_lugar = outro["cenario"] == resultado["cenario"] and outro["k"] == resultado["k"]
+        if mesmo_lugar and outro["algoritmo"] != resultado["algoritmo"]:
             resultado[f"ari_com_{outro['algoritmo']}"] = adjusted_rand_score(resultado["grupos"], outro["grupos"])
-tabela = pd.DataFrame(resultados)[["cenario", "algoritmo", "k", "silhueta", "soma_quadrados_intra",
-                                  "silhueta_media_subamostras", "ari_estabilidade_medio",
-                                  "ari_com_kmeans", "ari_com_ward", "ari_com_kmedoids"]]
-for cenario, configuracao in CENARIOS.items():
-    print(f"\nCenário {cenario}: {configuracao['descricao']}")
-    print(tabela[tabela["cenario"] == cenario].drop(columns="cenario").round(3).to_string(index=False))
+        referencia = (outro["conjunto"] == "completo" and outro["padronizacao"] == resultado["padronizacao"]
+                      and outro["algoritmo"] == resultado["algoritmo"] and outro["k"] == resultado["k"])
+        if referencia and resultado["conjunto"] != "completo":
+            resultado["ari_com_completo"] = adjusted_rand_score(resultado["grupos"], outro["grupos"])
+        outra_padronizacao = (outro["conjunto"] == resultado["conjunto"] and outro["padronizacao"] != resultado["padronizacao"]
+                              and outro["algoritmo"] == resultado["algoritmo"] and outro["k"] == resultado["k"])
+        if outra_padronizacao:
+            resultado["ari_com_outra_padronizacao"] = adjusted_rand_score(resultado["grupos"], outro["grupos"])
+tabela = pd.DataFrame(resultados).drop(columns=["grupos", "variaveis"])
+tabela_dbscan = pd.DataFrame(dbscan).drop(columns="variaveis")
 
-figura, eixos = plt.subplots(len(CENARIOS), len(METRICAS), figsize=(18, 8))
-for linha, (cenario, configuracao) in enumerate(CENARIOS.items()):
-    for coluna, (metrica, titulo) in enumerate(METRICAS.items()):
-        eixo = eixos[linha, coluna]
-        for algoritmo in ALGORITMOS:
-            pontos = tabela[(tabela["cenario"] == cenario) & (tabela["algoritmo"] == algoritmo)]
-            eixo.plot(pontos["k"], pontos[metrica], marker="o", label=algoritmo)
-        eixo.set_title(f"{cenario} · {configuracao['descricao']}\n{titulo}", fontsize=10)
+def figura_cotovelo(pontos, metrica, titulo, rotulo_y, cor):
+    """Cotovelo"""
+    figura, eixo = plt.subplots(figsize=(6, 4))
+    eixo.plot(pontos["k"], pontos[metrica], marker="o", color=cor)
+    eixo.set_title(titulo)
+    eixo.set_xlabel("k")
+    eixo.set_ylabel(rotulo_y)
+    eixo.set_xticks(VALORES_K)
+    eixo.spines[["top", "right"]].set_visible(False)
+    figura.tight_layout()
+    return figura
+
+def figura_dendrograma(arvore, titulo):
+    """Dendrograma de Ward"""
+    figura, eixo = plt.subplots(figsize=(7, 4.5))
+    dendrogram(arvore, ax=eixo, truncate_mode="lastp", p=VALORES_K[-1] * 2, color_threshold=0,
+               above_threshold_color=CORES["ward"])
+    eixo.set_title(titulo)
+    eixo.set_ylabel("Altura da união")
+    eixo.set_xlabel("Ramos")
+    eixo.spines[["top", "right"]].set_visible(False)
+    figura.tight_layout()
+    return figura
+
+def figura_distancias(distancias, min_samples, titulo):
+    """Distancia de cada município ao k-ésimo vizinho"""
+    figura, eixo = plt.subplots(figsize=(6, 4))
+    eixo.plot(range(1, len(distancias) + 1), distancias, color="#333333")
+    eixo.set_title(titulo)
+    eixo.set_xlabel("Municípios em ordem crescente")
+    eixo.set_ylabel(f"Distancia ao {min_samples}º vizinho")
+    eixo.spines[["top", "right"]].set_visible(False)
+    figura.tight_layout()
+    return figura
+
+def figura_silhueta_db(linhas, titulo):
+    """Silhueta e Davies-Bouldin contra k, uma linha por algoritmo"""
+    figura, eixos = plt.subplots(1, 2, figsize=(11, 4))
+    for eixo, (metrica, nome) in zip(eixos, [("silhueta", "Silhueta"),
+                                            ("davies_bouldin", "Davies-Bouldin")]):
+        for algoritmo in ALGORITMOS_K:
+            pontos = linhas[linhas["algoritmo"] == algoritmo]
+            eixo.plot(pontos["k"], pontos[metrica], marker="o", color=CORES[algoritmo],
+                      label=NOMES_ALGORITMOS[algoritmo])
+        eixo.set_title(nome)
         eixo.set_xlabel("k")
+        eixo.set_xticks(VALORES_K)
+        eixo.spines[["top", "right"]].set_visible(False)
         eixo.legend()
-figura.tight_layout()
-figura.savefig(SAIDA / "metricas_por_cenario.png", dpi=150)
+    figura.suptitle(titulo)
+    figura.tight_layout()
+    return figura
+
+def figuras_cenario(cenario, Z, linhas, arvore):
+    """Graficos x cenario"""
+    min_samples = hiperparametros("dbscan", Z.shape[1])["min_samples"]
+    titulo = cenario["descricao"]
+    figuras = {"distancias_dbscan": figura_distancias(distancias_vizinho(Z), min_samples, f"DBSCAN - {titulo}")}
+    if cenario["conjunto"] == "completo":
+        kmeans = linhas[linhas["algoritmo"] == "kmeans"]
+        kmedoids = linhas[linhas["algoritmo"] == "kmedoids"]
+        figuras["cotovelo_kmeans"] = figura_cotovelo(kmeans, "inercia", f"K-means - {titulo}", "Inércia",
+                                                     CORES["kmeans"])
+        figuras["cotovelo_kmedoids"] = figura_cotovelo(kmedoids, "perda", f"K-medoides - {titulo}", "Perda",
+                                                       CORES["kmedoids"])
+        figuras["dendrograma_ward"] = figura_dendrograma(arvore, f"Ward - {titulo}")
+        figuras["silhueta_davies_bouldin"] = figura_silhueta_db(linhas, titulo)
+    return figuras
 
 mlflow.set_tracking_uri("sqlite:///" + (RAIZ / "mlflow.db").as_posix())
 if mlflow.get_experiment_by_name(EXPERIMENTO) is None:
     mlflow.create_experiment(EXPERIMENTO, artifact_location=(RAIZ / "mlruns").as_uri())
-mlflow.set_experiment(EXPERIMENTO)
-with mlflow.start_run(run_name="experimento_cenarios"):
-    mlflow.set_tag("mlflow.note.content", "Dois cenários de preparação dos dados: as seis variáveis do modelo "
-                   "padronizadas com escore z ou com mín-máx. Em cada cenário, K-means, Ward e K-medoides com k de 2 a 8, sobre os "
-                   "144 municípios e sobre as mesmas 100 subamostras de 80%. Métricas: silhueta, soma de quadrados "
-                   "intragrupo (cotovelo) e ARI. O experimento não escolhe: a escolha se faz lendo as métricas.")
-    mlflow.log_params({"cenarios": ", ".join(CENARIOS), "algoritmos": ", ".join(ALGORITMOS), "valores_k": "2 a 8",
-                       "municipios": len(municipios), "subamostras": N_SUBAMOSTRAS, "fracao_subamostra": FRACAO_SUBAMOSTRA})
-    mlflow.log_figure(figura, "metricas_por_cenario.png")
-    for cenario, configuracao in CENARIOS.items():
-        with mlflow.start_run(run_name=f"{cenario} - {configuracao['descricao']}", nested=True):
-            mlflow.log_params({"cenario": cenario, "variaveis": ", ".join(matriz.columns),
-                               "padronizacao": configuracao["padronizacao"]})
-            for resultado in resultados:
-                if resultado["cenario"] == cenario:
-                    with mlflow.start_run(run_name=f"{cenario}_{resultado['algoritmo']}_k{resultado['k']}", nested=True):
-                        mlflow.log_params({"cenario": cenario, "padronizacao": configuracao["padronizacao"],
-                                           "algoritmo": resultado["algoritmo"], "k": resultado["k"],
-                                           **hiperparametros(resultado["algoritmo"])})
-                        metricas = {"silhueta": resultado["silhueta"],
-                                    "soma_quadrados_intra": resultado["soma_quadrados_intra"],
-                                    "silhueta_media_subamostras": resultado["silhueta_media_subamostras"],
-                                    "ari_estabilidade_medio": resultado["ari_estabilidade_medio"]}
-                        for outro in ALGORITMOS:
-                            if outro != resultado["algoritmo"]:
-                                metricas[f"ari_com_{outro}"] = resultado[f"ari_com_{outro}"]
-                        mlflow.log_metrics(metricas)
-                        for b in range(N_SUBAMOSTRAS):
-                            mlflow.log_metrics({"silhueta_subamostra": resultado["silhuetas_sub"][b],
-                                                "ari_subamostra": resultado["aris_sub"][b]}, step=b)
-plt.close(figura)
-
-linhas_cenarios = []
-for cenario, configuracao in CENARIOS.items():
-    linhas_cenarios.append({"cenario": cenario, "descricao": configuracao["descricao"],
-                            "variaveis": ", ".join(matriz.columns),
-                            "padronizacao": configuracao["padronizacao"]})
-tabela_cenarios = pd.DataFrame(linhas_cenarios)
-execucoes = mlflow.search_runs(experiment_names=[EXPERIMENTO])
-colunas = ["tags.mlflow.runName", "run_id", "tags.mlflow.parentRunId", "start_time"]
-for coluna in execucoes.columns:
-    if coluna.startswith("params."):
-        colunas.append(coluna)
-for coluna in execucoes.columns:
-    if coluna.startswith("metrics.") and not coluna.endswith("_subamostra"):
-        colunas.append(coluna)
-tabela_execucoes = execucoes[colunas].sort_values("tags.mlflow.runName").copy()
-tabela_execucoes["start_time"] = tabela_execucoes["start_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
-novos_nomes = []
-for coluna in colunas:
-    novos_nomes.append(coluna.replace("tags.mlflow.", "").replace("params.", "").replace("metrics.", ""))
-tabela_execucoes.columns = novos_nomes
+experimento = mlflow.set_experiment(EXPERIMENTO)
 cliente = MlflowClient()
-linhas_subamostras = []
-for _, execucao in execucoes.iterrows():
-    silhuetas_registradas = cliente.get_metric_history(execucao["run_id"], "silhueta_subamostra")
-    aris_registrados = cliente.get_metric_history(execucao["run_id"], "ari_subamostra")
-    for silhueta, ari in zip(silhuetas_registradas, aris_registrados):
-        linhas_subamostras.append({"execucao": execucao["tags.mlflow.runName"], "run_id": execucao["run_id"],
-                                   "subamostra": silhueta.step, "silhueta": silhueta.value, "ari": ari.value})
-tabela_subamostras = pd.DataFrame(linhas_subamostras).sort_values(["execucao", "subamostra"])
-nomes_municipios = pd.read_csv(SAIDA / "indicadores_municipio.csv", index_col="cod_mun")["municipio"]
-linhas_composicao = []
-for b, codigos in enumerate(subamostras):
-    for codigo in codigos:
-        linhas_composicao.append({"subamostra": b, "cod_mun": codigo, "municipio": nomes_municipios[codigo]})
-tabela_composicao = pd.DataFrame(linhas_composicao)
-with pd.ExcelWriter(SAIDA / "registro_mlflow.xlsx") as planilha:
-    tabela_cenarios.to_excel(planilha, sheet_name="cenarios", index=False)
-    tabela_execucoes.to_excel(planilha, sheet_name="execucoes", index=False)
-    tabela_subamostras.to_excel(planilha, sheet_name="subamostras", index=False)
-    tabela_composicao.to_excel(planilha, sheet_name="composicao_subamostras", index=False)
-print("Registro exportado para", SAIDA / "registro_mlflow.xlsx")
+anteriores = cliente.search_runs([experimento.experiment_id], max_results=50000)
+for execucao in anteriores:
+    cliente.delete_run(execucao.info.run_id) 
+if anteriores:
+    print(f"{len(anteriores)} execuções anteriores arquivadas no MLflow")
+with mlflow.start_run(run_name="experimento_cenarios"):
+    mlflow.set_tag("mlflow.note.content", "Seis cenários: tres conjuntos de variáveis (completo, só saneamento e exposição infantil), duas padronizacoes (escore z e min-max), quatro algoritmos (K-means, Ward, K-medoides e DBSCAN)")
+    mlflow.log_params({"conjuntos": ", ".join(CONJUNTOS), "padronizacoes": ", ".join(PADRONIZACOES),
+                       "algoritmos": ", ".join(ALGORITMOS_K + ["dbscan"]), "valores_k": "2 a 8",
+                       "valores_eps": N_VALORES_EPS, "municipios": len(indicadores)})
+    for cenario in cenarios():
+        with mlflow.start_run(run_name=cenario["descricao"], nested=True):
+            mlflow.log_params({"cenario": cenario["cenario"], "conjunto": cenario["conjunto"],
+                               "padronizacao": cenario["padronizacao"], "variaveis": ", ".join(cenario["variaveis"])})
+            Z = escalar(indicadores[cenario["variaveis"]], cenario["padronizacao"])
+            linhas = tabela[tabela["cenario"] == cenario["cenario"]]
+            for nome, figura in figuras_cenario(cenario, Z, linhas, arvores[cenario["cenario"]]).items():
+                mlflow.log_figure(figura, f"{nome}.png")
+                figura.savefig(FIGURAS / f"{cenario['cenario']}_{nome}.png", dpi=150)
+                plt.close(figura)
+            for resultado in resultados:
+                if resultado["cenario"] != cenario["cenario"]:
+                    continue
+                with mlflow.start_run(run_name=f"{cenario['cenario']}_{resultado['algoritmo']}_k{resultado['k']}",
+                                      nested=True):
+                    mlflow.log_params({"cenario": cenario["cenario"], "conjunto": cenario["conjunto"],
+                                       "padronizacao": cenario["padronizacao"], "algoritmo": resultado["algoritmo"],
+                                       "k": resultado["k"], **hiperparametros(resultado["algoritmo"])})
+                    metricas = {}
+                    for nome in ["silhueta", "davies_bouldin", "inercia", "perda", "altura_uniao", "ari_com_kmeans",
+                                 "ari_com_ward", "ari_com_kmedoids", "ari_com_completo", "ari_com_outra_padronizacao"]:
+                        if nome in resultado:
+                            metricas[nome] = resultado[nome]
+                    mlflow.log_metrics(metricas)
+            with mlflow.start_run(run_name=f"{cenario['cenario']}_dbscan", nested=True):
+                passos = tabela_dbscan[tabela_dbscan["cenario"] == cenario["cenario"]]
+                mlflow.log_params({"cenario": cenario["cenario"], "conjunto": cenario["conjunto"],
+                                   "padronizacao": cenario["padronizacao"], "algoritmo": "dbscan",
+                                   "eps": f"{N_VALORES_EPS} valores de {passos['eps'].min():.3f} a {passos['eps'].max():.3f}",
+                                   **hiperparametros("dbscan", len(cenario["variaveis"]))})
+                for _, passo in passos.iterrows():
+                    mlflow.log_metrics({"eps": passo["eps"], "n_grupos": passo["n_grupos"],
+                                        "ruido_pct": passo["ruido_pct"], "silhueta": passo["silhueta"],
+                                        "davies_bouldin": passo["davies_bouldin"]}, step=int(passo["passo"]))
+
